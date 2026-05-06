@@ -16,10 +16,10 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-var httpClient = &http.Client{Timeout: 8 * time.Second}
+var httpClient = &http.Client{Timeout: 7 * time.Second}
 
-// ===== KEYS =====
-var keys = strings.Split(os.Getenv("DEEPSEEK_KEYS"), ",")
+// ===== GROQ KEYS =====
+var keys = strings.Split(os.Getenv("GROQ_KEYS"), ",")
 var ki int
 var kmu sync.Mutex
 
@@ -55,6 +55,7 @@ func updateCtx(user, text string) {
 	v, _ := memory.LoadOrStore(user, "")
 	s := v.(string) + "\n" + text
 
+	// динамическое сжатие
 	if len(s) > 800 {
 		s = s[len(s)-800:]
 	}
@@ -64,79 +65,105 @@ func updateCtx(user, text string) {
 
 // ===== NORMALIZE =====
 func norm(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	return s
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
-// ===== AI =====
-var inflight sync.Map // защита от дублей
+// ===== TOKEN OPTIMIZER =====
+func smartTokens(prompt string) int {
+	l := len(prompt)
+
+	switch {
+	case l < 50:
+		return 80
+	case l < 200:
+		return 150
+	default:
+		return 250
+	}
+}
+
+// ===== GROQ AI =====
+var inflight sync.Map
 
 func askAI(prompt string) string {
 
 	prompt = norm(prompt)
-	key := hash(prompt)
+	keyHash := hash(prompt)
 
-	// cache
-	if v, ok := cache.Load(key); ok {
+	// ⚡ cache
+	if v, ok := cache.Load(keyHash); ok {
 		return "⚡ " + v.(string)
 	}
 
-	// дедупликация
-	if v, ok := inflight.Load(key); ok {
-		ch := v.(chan string)
-		return <-ch
+	// 🔁 дедупликация
+	if v, ok := inflight.Load(keyHash); ok {
+		return (<-v.(chan string))
 	}
 
 	ch := make(chan string, 1)
-	inflight.Store(key, ch)
+	inflight.Store(keyHash, ch)
 
 	go func() {
-		defer inflight.Delete(key)
+		defer inflight.Delete(keyHash)
 
+		// ✂️ обрезка
 		if len(prompt) > 700 {
 			prompt = prompt[len(prompt)-700:]
 		}
 
+		maxTokens := smartTokens(prompt)
+
 		body := map[string]interface{}{
-			"model": "deepseek-chat",
+			"model": "llama3-70b-8192",
 			"messages": []map[string]string{
 				{"role": "user", "content": prompt},
 			},
-			"max_tokens": 250,
+			"max_tokens": maxTokens,
 			"temperature": 0.7,
 		}
 
 		j, _ := json.Marshal(body)
 
+		key := nextKey()
+		if key == "" {
+			ch <- "❌ нет GROQ_KEYS"
+			return
+		}
+
 		req, _ := http.NewRequest("POST",
-			"https://api.deepseek.com/v1/chat/completions",
+			"https://api.groq.com/openai/v1/chat/completions",
 			bytes.NewBuffer(j),
 		)
 
-		req.Header.Set("Authorization", "Bearer "+nextKey())
+		req.Header.Set("Authorization", "Bearer "+key)
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			ch <- "⚠️ AI error"
+			ch <- "❌ сеть недоступна"
 			return
 		}
 		defer resp.Body.Close()
 
 		b, _ := io.ReadAll(resp.Body)
 
+		if resp.StatusCode != 200 {
+			ch <- "❌ AI: " + string(b)
+			return
+		}
+
 		var r map[string]interface{}
 		json.Unmarshal(b, &r)
 
 		choices, ok := r["choices"].([]interface{})
 		if !ok || len(choices) == 0 {
-			ch <- "⚠️ empty"
+			ch <- "❌ пустой ответ"
 			return
 		}
 
 		out := choices[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string)
 
-		cache.Store(key, out)
+		cache.Store(keyHash, out)
 		ch <- out
 	}()
 
@@ -153,7 +180,7 @@ func createSite(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&d)
 
-	html := askAI("создай современный адаптивный HTML сайт:\n" + d.Prompt)
+	html := askAI("создай красивый современный HTML сайт:\n" + d.Prompt)
 
 	id := hash(time.Now().String())[:8]
 
@@ -235,24 +262,9 @@ func ui(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`
 <!DOCTYPE html>
 <html>
-<head>
-<style>
-body{margin:0;background:#0f0f0f;color:white;font-family:sans-serif;display:flex;height:100vh}
-#left{width:320px;background:#111;padding:10px}
-#right{flex:1;background:white}
-textarea,input{width:100%;margin-top:5px;padding:8px}
-button{margin-top:5px;padding:8px;background:#4f46e5;color:white;border:none}
-.msg{margin:5px;padding:5px;border-radius:6px}
-.user{background:#2563eb}
-.ai{background:#1f2937}
-</style>
-</head>
+<body style="margin:0;background:#0f0f0f;color:white;font-family:sans-serif">
 
-<body>
-
-<div id="left">
-
-<h3>AI</h3>
+<h2>AI Builder</h2>
 
 <div id="chat"></div>
 
@@ -262,21 +274,19 @@ button{margin-top:5px;padding:8px;background:#4f46e5;color:white;border:none}
 <hr>
 
 <textarea id="prompt"></textarea>
-<button onclick="gen()">🌐 Generate Site</button>
+<button onclick="gen()">Generate Site</button>
 
-</div>
-
-<iframe id="right"></iframe>
+<iframe id="view" style="width:100%;height:400px"></iframe>
 
 <script>
 async function send(){
  let v=inp.value
- chat.innerHTML+=\`<div class="msg user">\${v}</div>\`
+ chat.innerHTML+= "<div>"+v+"</div>"
 
  let r=await fetch("/api",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({user:"web",prompt:v})})
  let d=await r.json()
 
- chat.innerHTML+=\`<div class="msg ai">\${d.response}</div>\`
+ chat.innerHTML+= "<div>"+d.response+"</div>"
 }
 
 async function gen(){
@@ -285,7 +295,7 @@ async function gen(){
  let r=await fetch("/create-site",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:p})})
  let d=await r.json()
 
- right.src="/site/"+d.id
+ view.src="/site/"+d.id
 }
 </script>
 
@@ -309,6 +319,6 @@ func main() {
 		port = "8080"
 	}
 
-	log.Println("ULTRA AI RUNNING:", port)
+	log.Println("ULTRA GROQ AI RUNNING:", port)
 	http.ListenAndServe(":"+port, nil)
 }
