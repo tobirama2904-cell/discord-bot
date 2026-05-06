@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log"
@@ -15,7 +14,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-var client = &http.Client{Timeout: 15 * time.Second}
+var client = &http.Client{Timeout: 12 * time.Second}
 
 // ===== KEYS =====
 var groqKeys = strings.Split(os.Getenv("GROQ_KEYS"), ",")
@@ -23,86 +22,105 @@ var togetherKeys = strings.Split(os.Getenv("TOGETHER_KEYS"), ",")
 var openaiKeys = strings.Split(os.Getenv("OPENAI_KEYS"), ",")
 
 var gi, ti, oi int
-
-func next(keys []string, i *int) string {
-	if len(keys) == 0 {
-		return ""
-	}
-	k := keys[*i]
-	*i = (*i + 1) % len(keys)
-	return k
-}
-
-// ===== CACHE =====
-var cache = make(map[string]string)
+var deadKeys = make(map[string]time.Time)
 var mu sync.Mutex
 
-func getCache(k string) (string, bool) {
+func next(keys []string, idx *int) string {
 	mu.Lock()
 	defer mu.Unlock()
-	v, ok := cache[k]
-	return v, ok
+
+	for i := 0; i < len(keys); i++ {
+		k := strings.TrimSpace(keys[*idx])
+		*idx = (*idx + 1) % len(keys)
+
+		if t, dead := deadKeys[k]; dead && time.Since(t) < 1*time.Minute {
+			continue
+		}
+
+		return k
+	}
+
+	return ""
 }
 
-func setCache(k, v string) {
+func markDead(k string) {
 	mu.Lock()
-	cache[k] = v
+	deadKeys[k] = time.Now()
 	mu.Unlock()
 }
 
+// ===== CACHE =====
+var cache sync.Map
+
+func getCache(k string) (string, bool) {
+	v, ok := cache.Load(k)
+	if !ok {
+		return "", false
+	}
+	return v.(string), true
+}
+
+func setCache(k, v string) {
+	cache.Store(k, v)
+}
+
 // ===== MEMORY =====
-var memory = make(map[string]string)
+var memory sync.Map
 
 func updateMemory(user, text string) {
-	memory[user] += "\n" + text
-	if len(memory[user]) > 2000 {
-		memory[user] = askFast("сожми:\n" + memory[user])
+	val, _ := memory.LoadOrStore(user, "")
+	s := val.(string) + "\n" + text
+
+	if len(s) > 1500 {
+		s = s[len(s)-1500:] // 🔥 сжатие
 	}
+
+	memory.Store(user, s)
 }
 
 func getContext(user string) string {
-	return memory[user]
+	v, _ := memory.LoadOrStore(user, "")
+	return v.(string)
 }
 
-// ===== AI =====
-func askFast(p string) string {
-	res, _ := askGroq(p)
-	return res
+// ===== HTTP SAFE =====
+func doReq(req *http.Request) ([]byte, error) {
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+
+	if res.StatusCode != 200 {
+		return nil, err
+	}
+
+	return body, nil
 }
 
-func askAI(p string) string {
+func parse(body []byte) (string, error) {
+	var r map[string]interface{}
+	json.Unmarshal(body, &r)
 
-	if v, ok := getCache(p); ok {
-		return "⚡ " + v
+	choices, ok := r["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return "", nil
 	}
 
-	if len(p) > 2000 {
-		p = p[len(p)-2000:]
-	}
-
-	providers := []func(string) (string, error){
-		askGroq,
-		askTogether,
-		askOpenAI,
-	}
-
-	for _, fn := range providers {
-		res, err := fn(p)
-		if err == nil && res != "" {
-			setCache(p, res)
-			return res
-		}
-	}
-
-	return "❌ AI error"
+	return choices[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
 }
 
 // ===== PROVIDERS =====
 func askGroq(p string) (string, error) {
 	key := next(groqKeys, &gi)
+	if key == "" {
+		return "", nil
+	}
 
 	body := map[string]interface{}{
-		"model": "llama3-70b-8192",
+		"model": "llama3-8b-8192",
 		"messages": []map[string]string{
 			{"role": "user", "content": p},
 		},
@@ -114,20 +132,20 @@ func askGroq(p string) (string, error) {
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 
-	res, err := client.Do(req)
+	b, err := doReq(req)
 	if err != nil {
+		markDead(key)
 		return "", err
 	}
-	defer res.Body.Close()
 
-	var r map[string]interface{}
-	json.NewDecoder(res.Body).Decode(&r)
-
-	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
+	return parse(b)
 }
 
 func askTogether(p string) (string, error) {
 	key := next(togetherKeys, &ti)
+	if key == "" {
+		return "", nil
+	}
 
 	body := map[string]interface{}{
 		"model": "meta-llama/Llama-3-70b-chat-hf",
@@ -142,20 +160,20 @@ func askTogether(p string) (string, error) {
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 
-	res, err := client.Do(req)
+	b, err := doReq(req)
 	if err != nil {
+		markDead(key)
 		return "", err
 	}
-	defer res.Body.Close()
 
-	var r map[string]interface{}
-	json.NewDecoder(res.Body).Decode(&r)
-
-	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
+	return parse(b)
 }
 
 func askOpenAI(p string) (string, error) {
 	key := next(openaiKeys, &oi)
+	if key == "" {
+		return "", nil
+	}
 
 	body := map[string]interface{}{
 		"model": "gpt-4o-mini",
@@ -170,45 +188,65 @@ func askOpenAI(p string) (string, error) {
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 
-	res, err := client.Do(req)
+	b, err := doReq(req)
 	if err != nil {
+		markDead(key)
 		return "", err
 	}
-	defer res.Body.Close()
 
-	var r map[string]interface{}
-	json.NewDecoder(res.Body).Decode(&r)
-
-	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
+	return parse(b)
 }
 
-// ===== DEPLOY =====
-func deploy(html string) string {
+// ===== AI CORE =====
+func askAI(p string) string {
 
-	token := os.Getenv("GITHUB_TOKEN")
-	repo := os.Getenv("GITHUB_REPO")
-
-	id := time.Now().Format("20060102150405")
-	path := "site-" + id + "/index.html"
-
-	api := "https://api.github.com/repos/" + repo + "/contents/" + path
-
-	content := map[string]interface{}{
-		"message": "deploy site",
-		"content": base64.StdEncoding.EncodeToString([]byte(html)),
+	if v, ok := getCache(p); ok {
+		return "⚡ " + v
 	}
 
-	j, _ := json.Marshal(content)
+	ctx := p
+	providers := []func(string) (string, error){
+		askGroq,
+		askTogether,
+		askOpenAI,
+	}
 
-	req, _ := http.NewRequest("PUT", api, bytes.NewBuffer(j))
-	req.Header.Set("Authorization", "Bearer "+token)
+	for i := 0; i < 2; i++ {
+		for _, fn := range providers {
 
-	client.Do(req)
+			res, err := fn(ctx)
+			if err != nil {
+				continue
+			}
 
-	user := strings.Split(repo, "/")[0]
-	repoName := strings.Split(repo, "/")[1]
+			if res != "" {
+				setCache(p, res)
+				return res
+			}
+		}
+	}
 
-	return "https://" + user + ".github.io/" + repoName + "/" + "site-" + id + "/"
+	return "⚠️ AI временно недоступен"
+}
+
+// ===== STREAMING =====
+func streamSend(s *discordgo.Session, ch string, text string) {
+
+	msg, _ := s.ChannelMessageSend(ch, "⏳ думаем...")
+
+	out := ""
+	words := strings.Split(text, " ")
+
+	for i, w := range words {
+		out += w + " "
+
+		if i%8 == 0 {
+			s.ChannelMessageEdit(ch, msg.ID, out)
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	s.ChannelMessageEdit(ch, msg.ID, out)
 }
 
 // ===== AGENT =====
@@ -217,13 +255,12 @@ func agent(userID, prompt string) string {
 	ctx := getContext(userID)
 	full := ctx + "\n" + prompt
 
-	if strings.Contains(prompt, "сайт") {
-		html := askAI("сделай красивый современный сайт:\n" + full)
-		link := deploy(html)
-		return "🚀 сайт готов:\n" + link
-	}
+	res := askAI(full)
 
-	return askAI(full)
+	updateMemory(userID, prompt)
+	updateMemory(userID, res)
+
+	return res
 }
 
 // ===== MAIN =====
@@ -240,21 +277,26 @@ func main() {
 		s.ChannelTyping(m.ChannelID)
 
 		go func() {
+
+			defer func() {
+				if err := recover(); err != nil {
+					log.Println("panic:", err)
+					s.ChannelMessageSend(m.ChannelID, "❌ ошибка")
+				}
+			}()
+
+			// ⚡ ultra fast
+			s.ChannelMessageSend(m.ChannelID, "⚡ думаю...")
+
 			res := agent(m.Author.ID, m.Content)
 
-			// 🔥 АВТОМАТИЧЕСКАЯ ПРАВИЛЬНАЯ ССЫЛКА
-			repo := os.Getenv("GITHUB_REPO")
-			parts := strings.Split(repo, "/")
+			streamSend(s, m.ChannelID, res)
 
-			editor := "https://" + parts[0] + ".github.io/" + parts[1] + "/editor.html"
-
-			s.ChannelMessageSend(m.ChannelID,
-				res+"\n\n🧩 Editor:\n"+editor)
 		}()
 	})
 
 	dg.Open()
-	log.Println("BOT RUNNING")
+	log.Println("ULTRA BOT RUNNING")
 
 	select {}
 }
