@@ -2,11 +2,10 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -16,7 +15,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-var client = &http.Client{Timeout: 20 * time.Second}
+var client = &http.Client{Timeout: 15 * time.Second}
 
 // ===== KEYS =====
 var groqKeys = strings.Split(os.Getenv("GROQ_KEYS"), ",")
@@ -24,63 +23,86 @@ var togetherKeys = strings.Split(os.Getenv("TOGETHER_KEYS"), ",")
 var openaiKeys = strings.Split(os.Getenv("OPENAI_KEYS"), ",")
 
 var gi, ti, oi int
-var mu sync.Mutex
 
 func next(keys []string, i *int) string {
-	mu.Lock()
-	defer mu.Unlock()
 	if len(keys) == 0 {
 		return ""
 	}
 	k := keys[*i]
 	*i = (*i + 1) % len(keys)
-	return strings.TrimSpace(k)
+	return k
+}
+
+// ===== CACHE =====
+var cache = make(map[string]string)
+var mu sync.Mutex
+
+func getCache(k string) (string, bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	v, ok := cache[k]
+	return v, ok
+}
+
+func setCache(k, v string) {
+	mu.Lock()
+	cache[k] = v
+	mu.Unlock()
+}
+
+// ===== MEMORY =====
+var memory = make(map[string]string)
+
+func updateMemory(user, text string) {
+	memory[user] += "\n" + text
+	if len(memory[user]) > 2000 {
+		memory[user] = askFast("сожми:\n" + memory[user])
+	}
+}
+
+func getContext(user string) string {
+	return memory[user]
 }
 
 // ===== AI =====
-func askAI(prompt string) string {
+func askFast(p string) string {
+	res, _ := askGroq(p)
+	return res
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+func askAI(p string) string {
 
-	providers := []func(context.Context, string) (string, error){
-		askGroq, askTogether, askOpenAI,
+	if v, ok := getCache(p); ok {
+		return "⚡ " + v
 	}
 
-	type res struct {
-		t string
-		e error
+	if len(p) > 2000 {
+		p = p[len(p)-2000:]
 	}
 
-	ch := make(chan res, 3)
+	providers := []func(string) (string, error){
+		askGroq,
+		askTogether,
+		askOpenAI,
+	}
 
 	for _, fn := range providers {
-		go func(f func(context.Context, string) (string, error)) {
-			r, e := f(ctx, prompt)
-			ch <- res{r, e}
-		}(fn)
-	}
-
-	for i := 0; i < len(providers); i++ {
-		select {
-		case r := <-ch:
-			if r.e == nil && r.t != "" {
-				return r.t
-			}
-		case <-ctx.Done():
-			return ""
+		res, err := fn(p)
+		if err == nil && res != "" {
+			setCache(p, res)
+			return res
 		}
 	}
 
-	return ""
+	return "❌ AI error"
 }
 
 // ===== PROVIDERS =====
-func askGroq(ctx context.Context, p string) (string, error) {
+func askGroq(p string) (string, error) {
 	key := next(groqKeys, &gi)
 
 	body := map[string]interface{}{
-		"model": "llama3-8b-8192",
+		"model": "llama3-70b-8192",
 		"messages": []map[string]string{
 			{"role": "user", "content": p},
 		},
@@ -88,10 +110,7 @@ func askGroq(ctx context.Context, p string) (string, error) {
 
 	j, _ := json.Marshal(body)
 
-	req, _ := http.NewRequestWithContext(ctx, "POST",
-		"https://api.groq.com/openai/v1/chat/completions",
-		bytes.NewBuffer(j))
-
+	req, _ := http.NewRequest("POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewBuffer(j))
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -107,7 +126,7 @@ func askGroq(ctx context.Context, p string) (string, error) {
 	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
 }
 
-func askTogether(ctx context.Context, p string) (string, error) {
+func askTogether(p string) (string, error) {
 	key := next(togetherKeys, &ti)
 
 	body := map[string]interface{}{
@@ -119,10 +138,7 @@ func askTogether(ctx context.Context, p string) (string, error) {
 
 	j, _ := json.Marshal(body)
 
-	req, _ := http.NewRequestWithContext(ctx, "POST",
-		"https://api.together.xyz/v1/chat/completions",
-		bytes.NewBuffer(j))
-
+	req, _ := http.NewRequest("POST", "https://api.together.xyz/v1/chat/completions", bytes.NewBuffer(j))
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -138,7 +154,7 @@ func askTogether(ctx context.Context, p string) (string, error) {
 	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
 }
 
-func askOpenAI(ctx context.Context, p string) (string, error) {
+func askOpenAI(p string) (string, error) {
 	key := next(openaiKeys, &oi)
 
 	body := map[string]interface{}{
@@ -150,10 +166,7 @@ func askOpenAI(ctx context.Context, p string) (string, error) {
 
 	j, _ := json.Marshal(body)
 
-	req, _ := http.NewRequestWithContext(ctx, "POST",
-		"https://api.openai.com/v1/chat/completions",
-		bytes.NewBuffer(j))
-
+	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(j))
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -169,47 +182,105 @@ func askOpenAI(ctx context.Context, p string) (string, error) {
 	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
 }
 
-// ===== GITHUB DEPLOY =====
-var token = os.Getenv("GITHUB_TOKEN")
-var repo = os.Getenv("GITHUB_REPO")
+// ===== BROWSER =====
+func browse(url string) string {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "❌ ошибка"
+	}
+	defer resp.Body.Close()
 
-func deploy(path, content string) {
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
 
-	api := "https://api.github.com/repos/" + repo + "/contents/" + path
+	if len(text) > 3000 {
+		text = text[:3000]
+	}
 
-	body := map[string]string{
-		"message": "deploy",
-		"content": base64.StdEncoding.EncodeToString([]byte(content)),
+	return askAI("проанализируй:\n" + text)
+}
+
+// ===== CODE =====
+func runPython(code string) string {
+
+	body := map[string]interface{}{
+		"language": "python",
+		"source":   code,
 	}
 
 	j, _ := json.Marshal(body)
 
+	resp, err := http.Post("https://emkc.org/api/v2/piston/execute", "application/json", bytes.NewBuffer(j))
+	if err != nil {
+		return "❌ ошибка"
+	}
+	defer resp.Body.Close()
+
+	out, _ := io.ReadAll(resp.Body)
+	return string(out)
+}
+
+// ===== DEPLOY =====
+func deploy(html string) string {
+
+	token := os.Getenv("GITHUB_TOKEN")
+	repo := os.Getenv("GITHUB_REPO")
+
+	id := time.Now().Format("20060102150405")
+	path := "site-" + id + "/index.html"
+
+	api := "https://api.github.com/repos/" + repo + "/contents/" + path
+
+	content := map[string]interface{}{
+		"message": "deploy site",
+		"content": base64.StdEncoding.EncodeToString([]byte(html)),
+	}
+
+	j, _ := json.Marshal(content)
+
 	req, _ := http.NewRequest("PUT", api, bytes.NewBuffer(j))
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	http.DefaultClient.Do(req)
+	client.Do(req)
+
+	user := strings.Split(repo, "/")[0]
+
+	return "https://" + user + ".github.io/" + strings.Split(repo, "/")[1] + "/" + "site-" + id + "/"
 }
 
-// ===== SERVER =====
+// ===== AGENT =====
+func agent(userID, prompt string) string {
+
+	ctx := getContext(userID)
+	full := ctx + "\n" + prompt
+
+	var res string
+
+	switch {
+	case strings.Contains(prompt, "сайт"):
+		html := askAI("сделай красивый современный сайт (как saas):\n" + full)
+		link := deploy(html)
+		res = "🚀 сайт готов:\n" + link
+
+	case strings.Contains(prompt, "код"):
+		code := askAI("напиши python код:\n" + full)
+		res = runPython(code)
+
+	case strings.Contains(prompt, "браузер"):
+		res = browse(strings.Replace(prompt, "браузер", "", 1))
+
+	default:
+		res = askAI(full)
+	}
+
+	updateMemory(userID, prompt)
+	updateMemory(userID, res)
+
+	return res
+}
+
+// ===== MAIN =====
 func main() {
-
-	http.HandleFunc("/save", func(w http.ResponseWriter, r *http.Request) {
-
-		body, _ := io.ReadAll(r.Body)
-
-		var data map[string]string
-		json.Unmarshal(body, &data)
-
-		html := data["html"]
-
-		id := fmt.Sprintf("site-%d", time.Now().Unix())
-
-		deploy(id+"/index.html", html)
-
-		w.Write([]byte("ok"))
-	})
-
-	go http.ListenAndServe(":8080", nil)
 
 	dg, _ := discordgo.New("Bot " + os.Getenv("DISCORD_TOKEN"))
 
@@ -222,15 +293,24 @@ func main() {
 		s.ChannelTyping(m.ChannelID)
 
 		go func() {
+			res := agent(m.Author.ID, m.Content)
 
-			editorURL := "http://your-server:8080/editor.html"
+			editor := "https://" + strings.Split(os.Getenv("GITHUB_REPO"), "/")[0] +
+				".github.io/" + strings.Split(os.Getenv("GITHUB_REPO"), "/")[1] + "/editor.html"
 
 			s.ChannelMessageSend(m.ChannelID,
-				"🧩 Editor:\n"+editorURL)
+				res+"\n\n🧩 Editor:\n"+editor)
 		}()
 	})
 
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	go http.ListenAndServe(":"+port, nil)
+
 	dg.Open()
+	log.Println("BOT RUNNING")
 
 	select {}
 }
