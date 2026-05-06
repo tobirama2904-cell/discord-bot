@@ -1,89 +1,309 @@
 package main
 
 import (
-	"fmt"
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
 
-func askUnlimitedAI(prompt, role string) string {
-	systemDesc := "Ты менеджер империи. Твоя цель управлять системой."
-	if role == "realizer" {
-		systemDesc = "Ты реализатор империи. Ты пишешь код и создаешь проекты."
+var client = &http.Client{Timeout: 20 * time.Second}
+
+// ===== KEYS =====
+var groqKeys = strings.Split(os.Getenv("GROQ_KEYS"), ",")
+var togetherKeys = strings.Split(os.Getenv("TOGETHER_KEYS"), ",")
+var openaiKeys = strings.Split(os.Getenv("OPENAI_KEYS"), ",")
+
+var gi, ti, oi int
+
+func next(keys []string, i *int) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	k := keys[*i]
+	*i = (*i + 1) % len(keys)
+	return k
+}
+
+// ===== CACHE =====
+var cache = make(map[string]string)
+var mu sync.Mutex
+
+func getCache(k string) (string, bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	v, ok := cache[k]
+	return v, ok
+}
+
+func setCache(k, v string) {
+	mu.Lock()
+	cache[k] = v
+	mu.Unlock()
+}
+
+// ===== MEMORY =====
+var memory = make(map[string]string)
+
+func updateMemory(user, text string) {
+	memory[user] += "\n" + text
+	if len(memory[user]) > 2000 {
+		memory[user] = askFast("сожми:\n" + memory[user])
+	}
+}
+
+func getContext(user string) string {
+	return memory[user]
+}
+
+// ===== AI =====
+func askFast(p string) string {
+	res, _ := askGroq(p)
+	return res
+}
+
+func askAI(p string) string {
+
+	if v, ok := getCache(p); ok {
+		return "⚡ " + v
 	}
 
-	cleanPrompt := url.QueryEscape(prompt)
-	cleanSystem := url.QueryEscape(systemDesc)
+	if len(p) > 2000 {
+		p = p[len(p)-2000:]
+	}
 
-	apiURL := fmt.Sprintf("https://pollinations.ai/%s?system=%s", cleanPrompt, cleanSystem)
+	providers := []func(string) (string, error){
+		askGroq,
+		askTogether,
+		askOpenAI,
+	}
 
-	resp, err := http.Get(apiURL)
+	for _, fn := range providers {
+		res, err := fn(p)
+		if err == nil && res != "" {
+			setCache(p, res)
+			return res
+		}
+	}
+
+	return "❌ AI error"
+}
+
+// ===== PROVIDERS =====
+func askGroq(p string) (string, error) {
+	key := next(groqKeys, &gi)
+
+	body := map[string]interface{}{
+		"model": "llama3-70b-8192",
+		"messages": []map[string]string{
+			{"role": "user", "content": p},
+		},
+	}
+
+	j, _ := json.Marshal(body)
+
+	req, _ := http.NewRequest("POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewBuffer(j))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := client.Do(req)
 	if err != nil {
-		return "❌ Ошибка: ИИ недоступен."
+		return "", err
+	}
+	defer res.Body.Close()
+
+	var r map[string]interface{}
+	json.NewDecoder(res.Body).Decode(&r)
+
+	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
+}
+
+func askTogether(p string) (string, error) {
+	key := next(togetherKeys, &ti)
+
+	body := map[string]interface{}{
+		"model": "meta-llama/Llama-3-70b-chat-hf",
+		"messages": []map[string]string{
+			{"role": "user", "content": p},
+		},
+	}
+
+	j, _ := json.Marshal(body)
+
+	req, _ := http.NewRequest("POST", "https://api.together.xyz/v1/chat/completions", bytes.NewBuffer(j))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	var r map[string]interface{}
+	json.NewDecoder(res.Body).Decode(&r)
+
+	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
+}
+
+func askOpenAI(p string) (string, error) {
+	key := next(openaiKeys, &oi)
+
+	body := map[string]interface{}{
+		"model": "gpt-4o-mini",
+		"messages": []map[string]string{
+			{"role": "user", "content": p},
+		},
+	}
+
+	j, _ := json.Marshal(body)
+
+	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(j))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	var r map[string]interface{}
+	json.NewDecoder(res.Body).Decode(&r)
+
+	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
+}
+
+// ===== BROWSER =====
+func browse(url string) string {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "❌ ошибка загрузки"
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "❌ Ошибка чтения ответа."
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+
+	if len(text) > 3000 {
+		text = text[:3000]
 	}
 
-	return string(body)
+	return askAI("проанализируй страницу:\n" + text)
 }
 
-func main() {
-	token := os.Getenv("DISCORD_TOKEN")
-	if token == "" {
-		log.Fatal("DISCORD_TOKEN не найден")
+// ===== CODE =====
+func runPython(code string) string {
+
+	body := map[string]interface{}{
+		"language": "python",
+		"source":   code,
 	}
 
-	dg, err := discordgo.New("Bot " + token)
+	j, _ := json.Marshal(body)
+
+	resp, err := http.Post("https://emkc.org/api/v2/piston/execute", "application/json", bytes.NewBuffer(j))
 	if err != nil {
-		log.Fatal("Ошибка создания сессии:", err)
+		return "❌ ошибка"
 	}
+	defer resp.Body.Close()
+
+	out, _ := io.ReadAll(resp.Body)
+	return string(out)
+}
+
+// ===== DEPLOY =====
+func deploy(html string) string {
+
+	token := os.Getenv("GITHUB_TOKEN")
+	repo := os.Getenv("GITHUB_REPO")
+
+	api := "https://api.github.com/repos/" + repo + "/contents/index.html"
+
+	content := map[string]interface{}{
+		"message": "update",
+		"content": base64.StdEncoding.EncodeToString([]byte(html)),
+	}
+
+	j, _ := json.Marshal(content)
+
+	req, _ := http.NewRequest("PUT", api, bytes.NewBuffer(j))
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client.Do(req)
+
+	user := strings.Split(repo, "/")[0]
+	return "https://" + user + ".github.io/"
+}
+
+// ===== AGENT =====
+func agent(userID, prompt string) string {
+
+	ctx := getContext(userID)
+	full := ctx + "\n" + prompt
+
+	var res string
+
+	switch {
+	case strings.Contains(prompt, "браузер"):
+		res = browse(strings.Replace(prompt, "браузер", "", 1))
+
+	case strings.Contains(prompt, "код"):
+		code := askAI("напиши python код:\n" + full)
+		res = runPython(code)
+
+	case strings.Contains(prompt, "сайт"):
+		html := askAI("html сайт:\n" + full)
+		res = deploy(html)
+
+	case strings.Contains(prompt, "авто"):
+		res = askAI("реши задачу пошагово:\n" + full)
+
+	default:
+		res = askAI(full)
+	}
+
+	updateMemory(userID, prompt)
+	updateMemory(userID, res)
+
+	return res
+}
+
+// ===== MAIN =====
+func main() {
+
+	dg, _ := discordgo.New("Bot " + os.Getenv("DISCORD_TOKEN"))
 
 	dg.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-		if m.Author.ID == s.State.User.ID {
+
+		if m.Author.Bot {
 			return
 		}
 
-		if strings.HasPrefix(m.Content, "!") {
-			s.ChannelTyping(m.ChannelID)
-			query := strings.TrimPrefix(m.Content, "!")
-			ans := askUnlimitedAI(query, "manager")
-			s.ChannelMessageSend(m.ChannelID, "**[МЕНЕДЖЕР]:**\n"+ans)
-		}
+		s.ChannelTyping(m.ChannelID)
 
-		if strings.HasPrefix(m.Content, ".") {
-			s.ChannelTyping(m.ChannelID)
-			query := strings.TrimPrefix(m.Content, ".")
-			ans := askUnlimitedAI(query, "realizer")
-			s.ChannelMessageSend(m.ChannelID, "**[РЕАЛИЗАТОР]:**\n"+ans)
-		}
+		go func() {
+			res := agent(m.Author.ID, m.Content)
+			s.ChannelMessageSend(m.ChannelID, res)
+		}()
 	})
 
-	// retry подключение
-	for i := 0; i < 5; i++ {
-		err = dg.Open()
-		if err == nil {
-			break
-		}
-		log.Println("Ошибка подключения, пробую снова...", err)
-		time.Sleep(5 * time.Second)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
+	go http.ListenAndServe(":"+port, nil)
 
-	if err != nil {
-		log.Fatal("Не удалось запустить бота:", err)
-	}
-
-	log.Println("Бот запущен")
+	dg.Open()
+	log.Println("BOT RUNNING")
 
 	select {}
 }
