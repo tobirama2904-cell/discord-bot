@@ -1,14 +1,9 @@
 package main
 
 import (
-	"bytes"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
-	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,136 +11,129 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-var client = &http.Client{Timeout: 10 * time.Second}
-
-// ===== GROQ KEYS =====
-var keys = strings.Split(os.Getenv("GROQ_KEYS"), ",")
-var ki int
-var mu sync.Mutex
-
-func nextKey() string {
-	mu.Lock()
-	defer mu.Unlock()
-
-	if len(keys) == 0 {
-		return ""
-	}
-	k := strings.TrimSpace(keys[ki])
-	ki = (ki + 1) % len(keys)
-	return k
-}
-
-// ===== CACHE =====
-var cache sync.Map
-
-func hash(s string) string {
-	h := sha1.Sum([]byte(s))
-	return hex.EncodeToString(h[:])
-}
+// ===== SETTINGS =====
+var aiEnabled = false // 🔥 можно включить позже
 
 // ===== MEMORY =====
-var memory sync.Map
-
-func getCtx(user string) string {
-	v, _ := memory.LoadOrStore(user, "")
-	return v.(string)
+type Memory struct {
+	Messages []string
 }
 
-func updateCtx(user, text string) {
-	v, _ := memory.LoadOrStore(user, "")
-	s := v.(string) + "\n" + text
+var userMemory sync.Map
 
-	if len(s) > 800 {
-		s = s[len(s)-800:]
+func addMemory(user, msg string) {
+	v, _ := userMemory.LoadOrStore(user, &Memory{})
+	mem := v.(*Memory)
+
+	mem.Messages = append(mem.Messages, msg)
+
+	if len(mem.Messages) > 20 {
+		mem.Messages = mem.Messages[len(mem.Messages)-20:]
 	}
-
-	memory.Store(user, s)
 }
 
-// ===== SMART TOKENS =====
-func smartTokens(prompt string) int {
-	l := len(prompt)
-
-	if l < 50 {
-		return 80
+func getMemory(user string) string {
+	v, ok := userMemory.Load(user)
+	if !ok {
+		return ""
 	}
-	if l < 200 {
-		return 150
-	}
-	return 250
+	mem := v.(*Memory)
+	return strings.Join(mem.Messages, "\n")
 }
 
-// ===== GROQ AI =====
-func askAI(prompt string) string {
+// ===== ANALYTICS =====
+var stats sync.Map
 
-	prompt = strings.TrimSpace(prompt)
-	keyHash := hash(prompt)
+func track(prompt string) {
+	p := strings.ToLower(prompt)
+	v, _ := stats.LoadOrStore(p, 0)
+	stats.Store(p, v.(int)+1)
+}
 
-	// cache
-	if v, ok := cache.Load(keyHash); ok {
-		return "⚡ " + v.(string)
+// ===== SMART RESPONSES =====
+func smartFallback(p string) string {
+
+	if strings.Contains(p, "деньги") {
+		return "💰 Начни с простого продукта и протестируй спрос."
 	}
 
-	key := nextKey()
-	if key == "" {
-		return "❌ GROQ_KEYS не задан"
+	if strings.Contains(p, "сайт") {
+		return "🌐 Создай лендинг с понятным оффером и кнопкой действия."
 	}
 
-	// обрезка
-	if len(prompt) > 700 {
-		prompt = prompt[len(prompt)-700:]
+	if strings.Contains(p, "бизнес") {
+		return "🚀 Найди проблему и реши её быстрее конкурентов."
 	}
 
-	body := map[string]interface{}{
-		"model": "llama3-70b-8192",
-		"messages": []map[string]string{
-			{"role": "user", "content": prompt},
-		},
-		"max_tokens": smartTokens(prompt),
+	return "🤖 Попробуй разбить задачу на простые шаги и начать с MVP."
+}
+
+// ===== AI ROUTER =====
+func askAI(user, prompt string) string {
+
+	p := strings.ToLower(strings.TrimSpace(prompt))
+
+	track(p)
+	addMemory(user, p)
+
+	// ===== RULES =====
+	if strings.Contains(p, "привет") {
+		return "Привет 👋 Чем помочь?"
 	}
 
-	j, _ := json.Marshal(body)
-
-	req, err := http.NewRequest("POST",
-		"https://api.groq.com/openai/v1/chat/completions",
-		bytes.NewBuffer(j),
-	)
-
-	if err != nil {
-		return "❌ request error"
+	if len(p) < 20 {
+		return "🤖 " + p + " — можно сделать быстро."
 	}
 
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "❌ сеть или API недоступен"
-	}
-	defer resp.Body.Close()
-
-	data, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != 200 {
-		return "❌ GROQ: " + string(data)
+	// ===== NO AI MODE =====
+	if !aiEnabled {
+		return smartFallback(p)
 	}
 
-	var r map[string]interface{}
-	if err := json.Unmarshal(data, &r); err != nil {
-		return "❌ JSON error"
-	}
+	// сюда можно потом вернуть AI
+	return smartFallback(p)
+}
 
-	choices, ok := r["choices"].([]interface{})
-	if !ok || len(choices) == 0 {
-		return "❌ пустой ответ"
-	}
+// ===== SITE GENERATOR (NO AI) =====
+func generateSite(prompt string) string {
 
-	msg := choices[0].(map[string]interface{})["message"].(map[string]interface{})
-	out := msg["content"].(string)
+	title := prompt
 
-	cache.Store(keyHash, out)
+	return `
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{margin:0;font-family:sans-serif;background:#0f0f0f;color:white}
+.hero{padding:100px;text-align:center}
+.btn{padding:12px 24px;background:#4f46e5;color:white;border:none;border-radius:8px}
+.section{padding:50px;background:#111}
+.card{background:#1f2937;padding:20px;margin:10px;border-radius:10px}
+</style>
+</head>
 
-	return out
+<body>
+
+<div class="hero">
+<h1>🚀 ` + title + `</h1>
+<p>Современный продукт</p>
+<button class="btn">Начать</button>
+</div>
+
+<div class="section">
+<h2>Функции</h2>
+<div class="card">⚡ Быстро</div>
+<div class="card">💰 Эффективно</div>
+<div class="card">🚀 Масштабируемо</div>
+</div>
+
+<div class="section">
+<h2>Почему мы</h2>
+<p>Минимум затрат — максимум результата</p>
+</div>
+
+</body>
+</html>`
 }
 
 // ===== SITES =====
@@ -158,19 +146,18 @@ func createSite(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&d)
 
-	html := askAI("создай красивый HTML сайт:\n" + d.Prompt)
+	html := generateSite(d.Prompt)
 
-	id := hash(time.Now().String())[:8]
-
+	id := strings.ReplaceAll(time.Now().String(), " ", "")[:10]
 	sites.Store(id, html)
 
 	json.NewEncoder(w).Encode(map[string]string{
-		"id":  id,
-		"url": "/site/" + id,
+		"id": id,
 	})
 }
 
 func getSite(w http.ResponseWriter, r *http.Request) {
+
 	id := strings.TrimPrefix(r.URL.Path, "/site/")
 
 	v, ok := sites.Load(id)
@@ -193,26 +180,30 @@ func api(w http.ResponseWriter, r *http.Request) {
 
 	json.NewDecoder(r.Body).Decode(&d)
 
-	ctx := getCtx(d.User)
-	full := ctx + "\n" + d.Prompt
-
-	res := askAI(full)
-
-	updateCtx(d.User, d.Prompt)
-	updateCtx(d.User, res)
+	res := askAI(d.User, d.Prompt)
 
 	json.NewEncoder(w).Encode(map[string]string{
 		"response": res,
 	})
 }
 
+// ===== ANALYTICS API =====
+func analytics(w http.ResponseWriter, r *http.Request) {
+
+	out := map[string]int{}
+
+	stats.Range(func(k, v interface{}) bool {
+		out[k.(string)] = v.(int)
+		return true
+	})
+
+	json.NewEncoder(w).Encode(out)
+}
+
 // ===== DISCORD =====
 func runBot() {
 
-	dg, err := discordgo.New("Bot " + os.Getenv("DISCORD_TOKEN"))
-	if err != nil {
-		log.Fatal(err)
-	}
+	dg, _ := discordgo.New("Bot " + getenv("DISCORD_TOKEN"))
 
 	dg.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
 
@@ -220,26 +211,11 @@ func runBot() {
 			return
 		}
 
-		s.ChannelTyping(m.ChannelID)
-
-		go func() {
-			defer func() {
-				if err := recover(); err != nil {
-					s.ChannelMessageSend(m.ChannelID, "❌ error")
-				}
-			}()
-
-			res := askAI(m.Content)
-			s.ChannelMessageSend(m.ChannelID, res)
-		}()
+		res := askAI(m.Author.ID, m.Content)
+		s.ChannelMessageSend(m.ChannelID, res)
 	})
 
-	err = dg.Open()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Println("Discord bot started")
+	dg.Open()
 }
 
 // ===== UI =====
@@ -250,9 +226,7 @@ func ui(w http.ResponseWriter, r *http.Request) {
 <html>
 <body style="background:#0f0f0f;color:white;font-family:sans-serif">
 
-<h2>AI Builder (Groq)</h2>
-
-<div id="chat"></div>
+<h2>🚀 AI SaaS Builder</h2>
 
 <input id="inp">
 <button onclick="send()">Send</button>
@@ -267,20 +241,15 @@ func ui(w http.ResponseWriter, r *http.Request) {
 <script>
 async function send(){
  let v=inp.value
- chat.innerHTML+="<div>"+v+"</div>"
-
  let r=await fetch("/api",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({user:"web",prompt:v})})
  let d=await r.json()
-
- chat.innerHTML+="<div>"+d.response+"</div>"
+ alert(d.response)
 }
 
 async function gen(){
  let p=prompt.value
-
  let r=await fetch("/create-site",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:p})})
  let d=await r.json()
-
  view.src="/site/"+d.id
 }
 </script>
@@ -290,10 +259,14 @@ async function gen(){
 `))
 }
 
+// ===== HELP =====
+func getenv(k string) string {
+	v := strings.TrimSpace(strings.Trim(os.Getenv(k), " "))
+	return v
+}
+
 // ===== MAIN =====
 func main() {
-
-	log.Println("GROQ_KEYS:", os.Getenv("GROQ_KEYS"))
 
 	go runBot()
 
@@ -301,12 +274,8 @@ func main() {
 	http.HandleFunc("/api", api)
 	http.HandleFunc("/create-site", createSite)
 	http.HandleFunc("/site/", getSite)
+	http.HandleFunc("/analytics", analytics)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	log.Println("SERVER RUNNING:", port)
-	http.ListenAndServe(":"+port, nil)
+	log.Println("🚀 SaaS RUNNING :8080")
+	http.ListenAndServe(":8080", nil)
 }
