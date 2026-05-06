@@ -182,44 +182,6 @@ func askOpenAI(p string) (string, error) {
 	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
 }
 
-// ===== BROWSER =====
-func browse(url string) string {
-	resp, err := http.Get(url)
-	if err != nil {
-		return "❌ ошибка"
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	text := string(body)
-
-	if len(text) > 3000 {
-		text = text[:3000]
-	}
-
-	return askAI("проанализируй:\n" + text)
-}
-
-// ===== CODE =====
-func runPython(code string) string {
-
-	body := map[string]interface{}{
-		"language": "python",
-		"source":   code,
-	}
-
-	j, _ := json.Marshal(body)
-
-	resp, err := http.Post("https://emkc.org/api/v2/piston/execute", "application/json", bytes.NewBuffer(j))
-	if err != nil {
-		return "❌ ошибка"
-	}
-	defer resp.Body.Close()
-
-	out, _ := io.ReadAll(resp.Body)
-	return string(out)
-}
-
 // ===== DEPLOY =====
 func deploy(html string) string {
 
@@ -244,8 +206,9 @@ func deploy(html string) string {
 	client.Do(req)
 
 	user := strings.Split(repo, "/")[0]
+	repoName := strings.Split(repo, "/")[1]
 
-	return "https://" + user + ".github.io/" + strings.Split(repo, "/")[1] + "/" + "site-" + id + "/"
+	return "https://" + user + ".github.io/" + repoName + "/" + "site-" + id + "/"
 }
 
 // ===== AGENT =====
@@ -254,29 +217,13 @@ func agent(userID, prompt string) string {
 	ctx := getContext(userID)
 	full := ctx + "\n" + prompt
 
-	var res string
-
-	switch {
-	case strings.Contains(prompt, "сайт"):
-		html := askAI("сделай красивый современный сайт (как saas):\n" + full)
+	if strings.Contains(prompt, "сайт") {
+		html := askAI("сделай красивый современный сайт:\n" + full)
 		link := deploy(html)
-		res = "🚀 сайт готов:\n" + link
-
-	case strings.Contains(prompt, "код"):
-		code := askAI("напиши python код:\n" + full)
-		res = runPython(code)
-
-	case strings.Contains(prompt, "браузер"):
-		res = browse(strings.Replace(prompt, "браузер", "", 1))
-
-	default:
-		res = askAI(full)
+		return "🚀 сайт готов:\n" + link
 	}
 
-	updateMemory(userID, prompt)
-	updateMemory(userID, res)
-
-	return res
+	return askAI(full)
 }
 
 // ===== MAIN =====
@@ -295,19 +242,16 @@ func main() {
 		go func() {
 			res := agent(m.Author.ID, m.Content)
 
-			editor := "https://" + strings.Split(os.Getenv("GITHUB_REPO"), "/")[0] +
-				".github.io/" + strings.Split(os.Getenv("GITHUB_REPO"), "/")[1] + "/editor.html"
+			// 🔥 АВТОМАТИЧЕСКАЯ ПРАВИЛЬНАЯ ССЫЛКА
+			repo := os.Getenv("GITHUB_REPO")
+			parts := strings.Split(repo, "/")
+
+			editor := "https://" + parts[0] + ".github.io/" + parts[1] + "/editor.html"
 
 			s.ChannelMessageSend(m.ChannelID,
 				res+"\n\n🧩 Editor:\n"+editor)
 		}()
 	})
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	go http.ListenAndServe(":"+port, nil)
 
 	dg.Open()
 	log.Println("BOT RUNNING")
