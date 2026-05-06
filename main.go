@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -14,28 +16,17 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-// ===== DATA =====
-type User struct {
-	Username string
-	Password string
-}
+var httpClient = &http.Client{Timeout: 8 * time.Second}
 
-type Site struct {
-	ID     string
-	Owner  string
-	HTML   string
-	Prompt string
-}
-
-var users sync.Map     // username -> User
-var sessions sync.Map  // token -> username
-var sites sync.Map     // id -> Site
-
-// ===== AI =====
+// ===== KEYS =====
 var keys = strings.Split(os.Getenv("DEEPSEEK_KEYS"), ",")
 var ki int
+var kmu sync.Mutex
 
 func nextKey() string {
+	kmu.Lock()
+	defer kmu.Unlock()
+
 	if len(keys) == 0 {
 		return ""
 	}
@@ -44,103 +35,129 @@ func nextKey() string {
 	return k
 }
 
-func askAI(prompt string) string {
+// ===== CACHE =====
+var cache sync.Map
 
-	body := map[string]interface{}{
-		"model": "deepseek-chat",
-		"messages": []map[string]string{
-			{"role": "user", "content": prompt},
-		},
-		"max_tokens": 400,
-	}
-
-	j, _ := json.Marshal(body)
-
-	req, _ := http.NewRequest("POST",
-		"https://api.deepseek.com/v1/chat/completions",
-		bytes.NewBuffer(j),
-	)
-
-	req.Header.Set("Authorization", "Bearer "+nextKey())
-	req.Header.Set("Content-Type", "application/json")
-
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "AI error"
-	}
-	defer res.Body.Close()
-
-	b, _ := io.ReadAll(res.Body)
-
-	var r map[string]interface{}
-	json.Unmarshal(b, &r)
-
-	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string)
+func hash(s string) string {
+	h := sha1.Sum([]byte(s))
+	return hex.EncodeToString(h[:])
 }
 
-// ===== AUTH =====
-func genToken() string {
-	return time.Now().Format("20060102150405")
-}
+// ===== MEMORY =====
+var memory sync.Map
 
-func register(w http.ResponseWriter, r *http.Request) {
-	var d User
-	json.NewDecoder(r.Body).Decode(&d)
-
-	users.Store(d.Username, d)
-
-	w.Write([]byte("ok"))
-}
-
-func login(w http.ResponseWriter, r *http.Request) {
-	var d User
-	json.NewDecoder(r.Body).Decode(&d)
-
-	u, ok := users.Load(d.Username)
-	if !ok || u.(User).Password != d.Password {
-		w.Write([]byte("error"))
-		return
-	}
-
-	token := genToken()
-	sessions.Store(token, d.Username)
-
-	json.NewEncoder(w).Encode(map[string]string{"token": token})
-}
-
-func auth(r *http.Request) string {
-	token := r.Header.Get("Authorization")
-	v, ok := sessions.Load(token)
-	if !ok {
-		return ""
-	}
+func getCtx(user string) string {
+	v, _ := memory.LoadOrStore(user, "")
 	return v.(string)
 }
 
-// ===== SITES =====
-func createSite(w http.ResponseWriter, r *http.Request) {
+func updateCtx(user, text string) {
+	v, _ := memory.LoadOrStore(user, "")
+	s := v.(string) + "\n" + text
 
-	user := auth(r)
-	if user == "" {
-		w.Write([]byte("auth error"))
-		return
+	if len(s) > 800 {
+		s = s[len(s)-800:]
 	}
+
+	memory.Store(user, s)
+}
+
+// ===== NORMALIZE =====
+func norm(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s
+}
+
+// ===== AI =====
+var inflight sync.Map // защита от дублей
+
+func askAI(prompt string) string {
+
+	prompt = norm(prompt)
+	key := hash(prompt)
+
+	// cache
+	if v, ok := cache.Load(key); ok {
+		return "⚡ " + v.(string)
+	}
+
+	// дедупликация
+	if v, ok := inflight.Load(key); ok {
+		ch := v.(chan string)
+		return <-ch
+	}
+
+	ch := make(chan string, 1)
+	inflight.Store(key, ch)
+
+	go func() {
+		defer inflight.Delete(key)
+
+		if len(prompt) > 700 {
+			prompt = prompt[len(prompt)-700:]
+		}
+
+		body := map[string]interface{}{
+			"model": "deepseek-chat",
+			"messages": []map[string]string{
+				{"role": "user", "content": prompt},
+			},
+			"max_tokens": 250,
+			"temperature": 0.7,
+		}
+
+		j, _ := json.Marshal(body)
+
+		req, _ := http.NewRequest("POST",
+			"https://api.deepseek.com/v1/chat/completions",
+			bytes.NewBuffer(j),
+		)
+
+		req.Header.Set("Authorization", "Bearer "+nextKey())
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			ch <- "⚠️ AI error"
+			return
+		}
+		defer resp.Body.Close()
+
+		b, _ := io.ReadAll(resp.Body)
+
+		var r map[string]interface{}
+		json.Unmarshal(b, &r)
+
+		choices, ok := r["choices"].([]interface{})
+		if !ok || len(choices) == 0 {
+			ch <- "⚠️ empty"
+			return
+		}
+
+		out := choices[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string)
+
+		cache.Store(key, out)
+		ch <- out
+	}()
+
+	return <-ch
+}
+
+// ===== SITES =====
+var sites sync.Map
+
+func createSite(w http.ResponseWriter, r *http.Request) {
 
 	var d struct {
 		Prompt string
 	}
 	json.NewDecoder(r.Body).Decode(&d)
 
-	html := askAI("сделай современный сайт:\n" + d.Prompt)
+	html := askAI("создай современный адаптивный HTML сайт:\n" + d.Prompt)
 
-	id := time.Now().Format("150405")
+	id := hash(time.Now().String())[:8]
 
-	sites.Store(id, Site{
-		ID:     id,
-		Owner:  user,
-		HTML:   html,
-		Prompt: d.Prompt,
-	})
+	sites.Store(id, html)
 
 	json.NewEncoder(w).Encode(map[string]string{
 		"id":  id,
@@ -148,25 +165,9 @@ func createSite(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func listSites(w http.ResponseWriter, r *http.Request) {
-
-	user := auth(r)
-
-	var res []Site
-
-	sites.Range(func(_, v interface{}) bool {
-		s := v.(Site)
-		if s.Owner == user {
-			res = append(res, s)
-		}
-		return true
-	})
-
-	json.NewEncoder(w).Encode(res)
-}
-
 func getSite(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/site/")
+
 	v, ok := sites.Load(id)
 	if !ok {
 		w.Write([]byte("404"))
@@ -174,7 +175,30 @@ func getSite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(v.(Site).HTML))
+	w.Write([]byte(v.(string)))
+}
+
+// ===== API =====
+func api(w http.ResponseWriter, r *http.Request) {
+
+	var d struct {
+		User   string
+		Prompt string
+	}
+
+	json.NewDecoder(r.Body).Decode(&d)
+
+	ctx := getCtx(d.User)
+	full := ctx + "\n" + d.Prompt
+
+	res := askAI(full)
+
+	updateCtx(d.User, d.Prompt)
+	updateCtx(d.User, res)
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"response": res,
+	})
 }
 
 // ===== DISCORD =====
@@ -191,6 +215,12 @@ func runBot() {
 		s.ChannelTyping(m.ChannelID)
 
 		go func() {
+			defer func() {
+				if err := recover(); err != nil {
+					s.ChannelMessageSend(m.ChannelID, "❌ error")
+				}
+			}()
+
 			res := askAI(m.Content)
 			s.ChannelMessageSend(m.ChannelID, res)
 		}()
@@ -208,11 +238,13 @@ func ui(w http.ResponseWriter, r *http.Request) {
 <head>
 <style>
 body{margin:0;background:#0f0f0f;color:white;font-family:sans-serif;display:flex;height:100vh}
-#left{width:300px;background:#111;padding:10px}
+#left{width:320px;background:#111;padding:10px}
 #right{flex:1;background:white}
-input,textarea{width:100%;margin-top:5px;padding:8px}
-button{margin-top:5px;padding:8px}
-.site{background:#1f2937;margin-top:5px;padding:5px;cursor:pointer}
+textarea,input{width:100%;margin-top:5px;padding:8px}
+button{margin-top:5px;padding:8px;background:#4f46e5;color:white;border:none}
+.msg{margin:5px;padding:5px;border-radius:6px}
+.user{background:#2563eb}
+.ai{background:#1f2937}
 </style>
 </head>
 
@@ -220,64 +252,40 @@ button{margin-top:5px;padding:8px}
 
 <div id="left">
 
-<h3>Auth</h3>
-<input id="user" placeholder="username">
-<input id="pass" placeholder="password">
+<h3>AI</h3>
 
-<button onclick="reg()">Register</button>
-<button onclick="log()">Login</button>
+<div id="chat"></div>
 
-<h3>Создать сайт</h3>
+<input id="inp">
+<button onclick="send()">Send</button>
+
+<hr>
+
 <textarea id="prompt"></textarea>
-<button onclick="create()">🚀 Создать</button>
-
-<h3>Мои сайты</h3>
-<div id="sites"></div>
+<button onclick="gen()">🌐 Generate Site</button>
 
 </div>
 
 <iframe id="right"></iframe>
 
 <script>
-let token=""
+async function send(){
+ let v=inp.value
+ chat.innerHTML+=\`<div class="msg user">\${v}</div>\`
 
-async function reg(){
- await fetch("/register",{method:"POST",body:JSON.stringify({
-  Username:user.value,Password:pass.value
- })})
- alert("ok")
-}
-
-async function log(){
- let r=await fetch("/login",{method:"POST",body:JSON.stringify({
-  Username:user.value,Password:pass.value
- })})
- let d=await r.json()
- token=d.token
- loadSites()
-}
-
-async function create(){
- let r=await fetch("/create-site",{
-  method:"POST",
-  headers:{"Authorization":token},
-  body:JSON.stringify({Prompt:prompt.value})
- })
- loadSites()
-}
-
-async function loadSites(){
- let r=await fetch("/sites",{headers:{"Authorization":token}})
+ let r=await fetch("/api",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({user:"web",prompt:v})})
  let d=await r.json()
 
- sites.innerHTML=""
- d.forEach(s=>{
-  sites.innerHTML+=\`<div class="site" onclick="openSite('${s.ID}')">\${s.Prompt}</div>\`
- })
+ chat.innerHTML+=\`<div class="msg ai">\${d.response}</div>\`
 }
 
-function openSite(id){
- right.src="/site/"+id
+async function gen(){
+ let p=prompt.value
+
+ let r=await fetch("/create-site",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt:p})})
+ let d=await r.json()
+
+ right.src="/site/"+d.id
 }
 </script>
 
@@ -292,10 +300,8 @@ func main() {
 	go runBot()
 
 	http.HandleFunc("/", ui)
-	http.HandleFunc("/register", register)
-	http.HandleFunc("/login", login)
+	http.HandleFunc("/api", api)
 	http.HandleFunc("/create-site", createSite)
-	http.HandleFunc("/sites", listSites)
 	http.HandleFunc("/site/", getSite)
 
 	port := os.Getenv("PORT")
@@ -303,6 +309,6 @@ func main() {
 		port = "8080"
 	}
 
-	log.Println("RUNNING", port)
+	log.Println("ULTRA AI RUNNING:", port)
 	http.ListenAndServe(":"+port, nil)
 }
