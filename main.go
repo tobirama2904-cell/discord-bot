@@ -3,10 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -16,7 +16,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-var client = &http.Client{Timeout: 25 * time.Second}
+var client = &http.Client{Timeout: 20 * time.Second}
 
 // ===== KEYS =====
 var groqKeys = strings.Split(os.Getenv("GROQ_KEYS"), ",")
@@ -24,35 +24,35 @@ var togetherKeys = strings.Split(os.Getenv("TOGETHER_KEYS"), ",")
 var openaiKeys = strings.Split(os.Getenv("OPENAI_KEYS"), ",")
 
 var gi, ti, oi int
-var keyMu sync.Mutex
+var mu sync.Mutex
 
 func next(keys []string, i *int) string {
-	keyMu.Lock()
-	defer keyMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 	if len(keys) == 0 {
 		return ""
 	}
 	k := keys[*i]
 	*i = (*i + 1) % len(keys)
-	return k
+	return strings.TrimSpace(k)
 }
 
-// ===== AI CORE =====
+// ===== AI =====
 func askAI(prompt string) string {
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-
-	type res struct {
-		text string
-		err  error
-	}
-
-	ch := make(chan res, 3)
 
 	providers := []func(context.Context, string) (string, error){
 		askGroq, askTogether, askOpenAI,
 	}
+
+	type res struct {
+		t string
+		e error
+	}
+
+	ch := make(chan res, 3)
 
 	for _, fn := range providers {
 		go func(f func(context.Context, string) (string, error)) {
@@ -64,15 +64,15 @@ func askAI(prompt string) string {
 	for i := 0; i < len(providers); i++ {
 		select {
 		case r := <-ch:
-			if r.err == nil && r.text != "" {
-				return r.text
+			if r.e == nil && r.t != "" {
+				return r.t
 			}
 		case <-ctx.Done():
-			return "❌ timeout"
+			return ""
 		}
 	}
 
-	return "❌ AI error"
+	return ""
 }
 
 // ===== PROVIDERS =====
@@ -80,7 +80,7 @@ func askGroq(ctx context.Context, p string) (string, error) {
 	key := next(groqKeys, &gi)
 
 	body := map[string]interface{}{
-		"model": "llama3-70b-8192",
+		"model": "llama3-8b-8192",
 		"messages": []map[string]string{
 			{"role": "user", "content": p},
 		},
@@ -169,113 +169,47 @@ func askOpenAI(ctx context.Context, p string) (string, error) {
 	return r["choices"].([]interface{})[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string), nil
 }
 
-// ===== STORAGE =====
-type Site struct {
-	ID   string
-	Type string
-	HTML string
-	Time time.Time
-}
+// ===== GITHUB DEPLOY =====
+var token = os.Getenv("GITHUB_TOKEN")
+var repo = os.Getenv("GITHUB_REPO")
 
-var sites = make(map[string]Site)
-var mu sync.Mutex
+func deploy(path, content string) {
 
-// ===== GENERATION =====
-func generate(prompt string) Site {
+	api := "https://api.github.com/repos/" + repo + "/contents/" + path
 
-	mode := "site"
-	if strings.Contains(prompt, "app") {
-		mode = "app"
+	body := map[string]string{
+		"message": "deploy",
+		"content": base64.StdEncoding.EncodeToString([]byte(content)),
 	}
 
-	html := askAI(`
-создай ultra современный продукт как Framer:
-- красивый UI
-- tailwind
-- glassmorphism
-- анимации
-- интерактивность
-- кнопки
-- адаптивность
+	j, _ := json.Marshal(body)
 
-тип: ` + mode + `
-тема: ` + prompt)
+	req, _ := http.NewRequest("PUT", api, bytes.NewBuffer(j))
+	req.Header.Set("Authorization", "Bearer "+token)
 
-	id := fmt.Sprintf("%d", time.Now().UnixNano())
-
-	return Site{
-		ID:   id,
-		Type: mode,
-		HTML: html,
-		Time: time.Now(),
-	}
+	http.DefaultClient.Do(req)
 }
 
-// ===== PANEL UI =====
-func panel(domain string) string {
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	html := `
-<style>
-body{background:#0f172a;color:white;font-family:sans-serif;padding:20px}
-.card{background:#1e293b;padding:15px;margin:10px;border-radius:15px}
-a{color:#3b82f6}
-</style>
-<h1>🚀 AI Platform</h1>
-`
-
-	for _, s := range sites {
-		html += fmt.Sprintf(`
-<div class="card">
-<b>%s</b><br>
-тип: %s<br>
-<a href="%s/site/%s">Открыть</a>
-</div>
-`, s.ID, s.Type, domain, s.ID)
-	}
-
-	return html
-}
-
-// ===== WEB =====
-func startWeb(domain string) {
-
-	http.HandleFunc("/site/", func(w http.ResponseWriter, r *http.Request) {
-		id := strings.TrimPrefix(r.URL.Path, "/site/")
-		mu.Lock()
-		s, ok := sites[id]
-		mu.Unlock()
-
-		if ok {
-			w.Write([]byte(s.HTML))
-			return
-		}
-		http.NotFound(w, r)
-	})
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(panel(domain)))
-	})
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	go http.ListenAndServe(":"+port, nil)
-}
-
-// ===== MAIN =====
+// ===== SERVER =====
 func main() {
 
-	domain := os.Getenv("DOMAIN")
-	if domain == "" {
-		domain = "http://localhost:8080"
-	}
+	http.HandleFunc("/save", func(w http.ResponseWriter, r *http.Request) {
 
-	startWeb(domain)
+		body, _ := io.ReadAll(r.Body)
+
+		var data map[string]string
+		json.Unmarshal(body, &data)
+
+		html := data["html"]
+
+		id := fmt.Sprintf("site-%d", time.Now().Unix())
+
+		deploy(id+"/index.html", html)
+
+		w.Write([]byte("ok"))
+	})
+
+	go http.ListenAndServe(":8080", nil)
 
 	dg, _ := discordgo.New("Bot " + os.Getenv("DISCORD_TOKEN"))
 
@@ -289,21 +223,14 @@ func main() {
 
 		go func() {
 
-			site := generate(m.Content)
-
-			mu.Lock()
-			sites[site.ID] = site
-			mu.Unlock()
-
-			link := domain + "/site/" + site.ID
+			editorURL := "http://your-server:8080/editor.html"
 
 			s.ChannelMessageSend(m.ChannelID,
-				"🚀 Готово:\n"+link+"\n\n📊 Панель:\n"+domain)
+				"🧩 Editor:\n"+editorURL)
 		}()
 	})
 
 	dg.Open()
-	log.Println("ULTRA AI PLATFORM RUNNING")
 
 	select {}
 }
