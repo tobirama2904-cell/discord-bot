@@ -16,16 +16,16 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-var httpClient = &http.Client{Timeout: 7 * time.Second}
+var client = &http.Client{Timeout: 10 * time.Second}
 
 // ===== GROQ KEYS =====
 var keys = strings.Split(os.Getenv("GROQ_KEYS"), ",")
 var ki int
-var kmu sync.Mutex
+var mu sync.Mutex
 
 func nextKey() string {
-	kmu.Lock()
-	defer kmu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 
 	if len(keys) == 0 {
 		return ""
@@ -55,7 +55,6 @@ func updateCtx(user, text string) {
 	v, _ := memory.LoadOrStore(user, "")
 	s := v.(string) + "\n" + text
 
-	// динамическое сжатие
 	if len(s) > 800 {
 		s = s[len(s)-800:]
 	}
@@ -63,111 +62,90 @@ func updateCtx(user, text string) {
 	memory.Store(user, s)
 }
 
-// ===== NORMALIZE =====
-func norm(s string) string {
-	return strings.ToLower(strings.TrimSpace(s))
-}
-
-// ===== TOKEN OPTIMIZER =====
+// ===== SMART TOKENS =====
 func smartTokens(prompt string) int {
 	l := len(prompt)
 
-	switch {
-	case l < 50:
+	if l < 50 {
 		return 80
-	case l < 200:
-		return 150
-	default:
-		return 250
 	}
+	if l < 200 {
+		return 150
+	}
+	return 250
 }
 
 // ===== GROQ AI =====
-var inflight sync.Map
-
 func askAI(prompt string) string {
 
-	prompt = norm(prompt)
+	prompt = strings.TrimSpace(prompt)
 	keyHash := hash(prompt)
 
-	// ⚡ cache
+	// cache
 	if v, ok := cache.Load(keyHash); ok {
 		return "⚡ " + v.(string)
 	}
 
-	// 🔁 дедупликация
-	if v, ok := inflight.Load(keyHash); ok {
-		return (<-v.(chan string))
+	key := nextKey()
+	if key == "" {
+		return "❌ GROQ_KEYS не задан"
 	}
 
-	ch := make(chan string, 1)
-	inflight.Store(keyHash, ch)
+	// обрезка
+	if len(prompt) > 700 {
+		prompt = prompt[len(prompt)-700:]
+	}
 
-	go func() {
-		defer inflight.Delete(keyHash)
+	body := map[string]interface{}{
+		"model": "llama3-70b-8192",
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"max_tokens": smartTokens(prompt),
+	}
 
-		// ✂️ обрезка
-		if len(prompt) > 700 {
-			prompt = prompt[len(prompt)-700:]
-		}
+	j, _ := json.Marshal(body)
 
-		maxTokens := smartTokens(prompt)
+	req, err := http.NewRequest("POST",
+		"https://api.groq.com/openai/v1/chat/completions",
+		bytes.NewBuffer(j),
+	)
 
-		body := map[string]interface{}{
-			"model": "llama3-70b-8192",
-			"messages": []map[string]string{
-				{"role": "user", "content": prompt},
-			},
-			"max_tokens": maxTokens,
-			"temperature": 0.7,
-		}
+	if err != nil {
+		return "❌ request error"
+	}
 
-		j, _ := json.Marshal(body)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
 
-		key := nextKey()
-		if key == "" {
-			ch <- "❌ нет GROQ_KEYS"
-			return
-		}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "❌ сеть или API недоступен"
+	}
+	defer resp.Body.Close()
 
-		req, _ := http.NewRequest("POST",
-			"https://api.groq.com/openai/v1/chat/completions",
-			bytes.NewBuffer(j),
-		)
+	data, _ := io.ReadAll(resp.Body)
 
-		req.Header.Set("Authorization", "Bearer "+key)
-		req.Header.Set("Content-Type", "application/json")
+	if resp.StatusCode != 200 {
+		return "❌ GROQ: " + string(data)
+	}
 
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			ch <- "❌ сеть недоступна"
-			return
-		}
-		defer resp.Body.Close()
+	var r map[string]interface{}
+	if err := json.Unmarshal(data, &r); err != nil {
+		return "❌ JSON error"
+	}
 
-		b, _ := io.ReadAll(resp.Body)
+	choices, ok := r["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return "❌ пустой ответ"
+	}
 
-		if resp.StatusCode != 200 {
-			ch <- "❌ AI: " + string(b)
-			return
-		}
+	msg := choices[0].(map[string]interface{})["message"].(map[string]interface{})
+	out := msg["content"].(string)
 
-		var r map[string]interface{}
-		json.Unmarshal(b, &r)
+	cache.Store(keyHash, out)
 
-		choices, ok := r["choices"].([]interface{})
-		if !ok || len(choices) == 0 {
-			ch <- "❌ пустой ответ"
-			return
-		}
-
-		out := choices[0].(map[string]interface{})["message"].(map[string]interface{})["content"].(string)
-
-		cache.Store(keyHash, out)
-		ch <- out
-	}()
-
-	return <-ch
+	return out
 }
 
 // ===== SITES =====
@@ -180,7 +158,7 @@ func createSite(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&d)
 
-	html := askAI("создай красивый современный HTML сайт:\n" + d.Prompt)
+	html := askAI("создай красивый HTML сайт:\n" + d.Prompt)
 
 	id := hash(time.Now().String())[:8]
 
@@ -231,7 +209,10 @@ func api(w http.ResponseWriter, r *http.Request) {
 // ===== DISCORD =====
 func runBot() {
 
-	dg, _ := discordgo.New("Bot " + os.Getenv("DISCORD_TOKEN"))
+	dg, err := discordgo.New("Bot " + os.Getenv("DISCORD_TOKEN"))
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	dg.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
 
@@ -253,7 +234,12 @@ func runBot() {
 		}()
 	})
 
-	dg.Open()
+	err = dg.Open()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("Discord bot started")
 }
 
 // ===== UI =====
@@ -262,9 +248,9 @@ func ui(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`
 <!DOCTYPE html>
 <html>
-<body style="margin:0;background:#0f0f0f;color:white;font-family:sans-serif">
+<body style="background:#0f0f0f;color:white;font-family:sans-serif">
 
-<h2>AI Builder</h2>
+<h2>AI Builder (Groq)</h2>
 
 <div id="chat"></div>
 
@@ -281,12 +267,12 @@ func ui(w http.ResponseWriter, r *http.Request) {
 <script>
 async function send(){
  let v=inp.value
- chat.innerHTML+= "<div>"+v+"</div>"
+ chat.innerHTML+="<div>"+v+"</div>"
 
  let r=await fetch("/api",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({user:"web",prompt:v})})
  let d=await r.json()
 
- chat.innerHTML+= "<div>"+d.response+"</div>"
+ chat.innerHTML+="<div>"+d.response+"</div>"
 }
 
 async function gen(){
@@ -307,6 +293,8 @@ async function gen(){
 // ===== MAIN =====
 func main() {
 
+	log.Println("GROQ_KEYS:", os.Getenv("GROQ_KEYS"))
+
 	go runBot()
 
 	http.HandleFunc("/", ui)
@@ -319,6 +307,6 @@ func main() {
 		port = "8080"
 	}
 
-	log.Println("ULTRA GROQ AI RUNNING:", port)
+	log.Println("SERVER RUNNING:", port)
 	http.ListenAndServe(":"+port, nil)
 }
